@@ -89,7 +89,10 @@ cp .env.example .env
 |----------|:-----------:|-----------|---------|
 | `BASE_URL` | ✅ | URL base do recurso de motocicletas na API REST | `http://localhost:3000/motorcycles` |
 | `API_TOKEN` | ✅ | Token de acesso à API (validado na inicialização) | `meu-token` |
-| `PORT` | ❌ | Porta da API (padrão: `3000`) | `3000` |
+| `PORT` | ✅ | Porta da API (padrão: `3000`) | `3000` |
+
+**Projeto para download**
+express-backend: https://github.com/BHAraujo/express-backend
 
 
 
