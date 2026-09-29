@@ -1,0 +1,326 @@
+# fastmcp-ts
+
+The TypeScript framework for building [Model Context Protocol](https://modelcontextprotocol.io) servers, clients, and apps. The official TypeScript counterpart to [FastMCP for Python](https://github.com/PrefectHQ/fastmcp) - built and maintained with 💙 by the same team at [Prefect](https://prefect.io).
+
+Built on version 2 of the official [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) — the scoped `@modelcontextprotocol/server` and `@modelcontextprotocol/client` packages. FastMCP handles the protocol plumbing so you can focus on what your server actually does.
+
+FastMCP 1.0 speaks both MCP protocol generations: the 2025 legacy era and the 2026-07-28 modern era. A server serves both at once, and a client negotiates one. The client negotiates automatically by default: it probes once at connect, uses the modern era when the server offers it, and falls back to legacy otherwise, so upgrading from 0.x keeps your existing code running against servers of either generation. Pass `versionNegotiation: { mode: 'legacy' }` to opt out of the probe. The [migration guide](docs/migration.mdx) covers the upgrade path.
+
+## Installation
+
+```bash
+npm install @prefecthq/fastmcp-ts
+```
+
+---
+
+## Servers
+
+Turn TypeScript functions into MCP tools, resources, and prompts. Input schemas are inferred automatically from any [Standard Schema](https://standardschema.dev)-compatible library: Zod, Valibot, ArkType, and others.
+
+```typescript
+import { FastMCP } from '@prefecthq/fastmcp-ts/server'
+import { z } from 'zod'
+
+const server = new FastMCP({ name: 'my-server', version: '1.0.0' })
+
+server.tool(
+  {
+    name: 'add',
+    description: 'Add two numbers',
+    input: z.object({ a: z.number(), b: z.number() }),
+  },
+  ({ a, b }) => a + b
+)
+
+server.resource(
+  { uri: 'config://settings', description: 'App configuration' },
+  () => JSON.stringify({ theme: 'dark', lang: 'en' })
+)
+
+server.resource(
+  { uri: 'user://{id}', description: 'User by ID' },
+  ({ id }) => `User #${id}`
+)
+
+server.prompt(
+  {
+    name: 'review_code',
+    description: 'Review code for quality and correctness',
+    arguments: [
+      { name: 'code', required: true },
+      { name: 'language', required: false },
+    ],
+  },
+  ({ code, language }) =>
+    `Review this ${language ?? 'code'} for quality and correctness:\n\n${code}`
+)
+
+await server.run()                              // stdio (default)
+// await server.run({ transport: 'http', port: 3000 })
+```
+
+Save this file as `server.ts`. Installing `@prefecthq/fastmcp-ts` also installs the `fastmcp` CLI. Use it to inspect the server and call a tool, with no build step:
+
+```bash
+npx fastmcp inspect --file server.ts
+npx fastmcp call add --file server.ts a=1 b=2
+```
+
+### Context
+
+Handlers access logging, progress, LLM sampling, user elicitation, and per-session state through an ambient context with no prop-drilling.
+
+```typescript
+import { FastMCP } from '@prefecthq/fastmcp-ts/server'
+import { z } from 'zod'
+
+const server = new FastMCP({ name: 'assistant' })
+
+server.tool(
+  {
+    name: 'summarize',
+    description: 'Summarize a document',
+    input: z.object({ text: z.string() }),
+  },
+  async ({ text }) => {
+    const ctx = server.getContext()
+
+    await ctx.info('Sending document to LLM')
+    await ctx.reportProgress(0, 1, 'Sampling…')
+
+    const { content } = await ctx.sample({
+      messages: [{ role: 'user', content: { type: 'text', text: `Summarize:\n${text}` } }],
+      maxTokens: 512,
+    })
+
+    return content.type === 'text' ? content.text : ''
+  }
+)
+```
+
+### Middleware & Auth
+
+```typescript
+import { FastMCP, LoggingMiddleware, RateLimitingMiddleware, jwtVerifier } from '@prefecthq/fastmcp-ts/server'
+
+const server = new FastMCP({
+  name: 'secure-server',
+  auth: jwtVerifier({
+    jwksUri: 'https://auth.example.com/.well-known/jwks.json',
+    issuer: 'https://auth.example.com',
+    audience: 'my-mcp-server',
+  }),
+})
+
+server.use(new LoggingMiddleware())
+server.use(new RateLimitingMiddleware(100, 60_000))  // 100 requests per minute
+
+await server.run({ transport: 'http', port: 3000 })
+```
+
+### Composition
+
+Mount child servers onto a parent with optional name-prefix namespacing.
+
+```typescript
+import { FastMCP, createProxy } from '@prefecthq/fastmcp-ts/server'
+
+const weather = new FastMCP({ name: 'weather' })
+weather.tool({ name: 'forecast', description: 'Get a forecast', input: z.object({ city: z.string() }) }, ({ city }) => `Forecast for ${city}`)
+
+// Wrap a remote server as a mountable instance
+const maps = await createProxy({ type: 'http', url: 'http://maps-service/mcp' })
+
+const gateway = new FastMCP({ name: 'gateway' })
+gateway.mount(weather, 'weather')   // → weather_forecast
+gateway.mount(maps, 'maps')         // → maps_<tool_name>
+
+await gateway.run({ transport: 'http', port: 3000 })
+```
+
+---
+
+## Clients
+
+```typescript
+import { Client } from '@prefecthq/fastmcp-ts/client'
+
+const client = await Client.connect('http://localhost:3000')
+
+const tools     = await client.listTools()
+const resources = await client.listResources()
+const prompts   = await client.listPrompts()
+
+const result = await client.callTool('add', { a: 1, b: 2 })
+const config = await client.readResource('config://settings')
+const review = await client.getPrompt('review_code', { code: 'const x = 1' })
+
+await client.close()
+```
+
+Use `await using` for automatic cleanup:
+
+```typescript
+await using client = await Client.connect('http://localhost:3000')
+const result = await client.callTool('add', { a: 1, b: 2 })
+// client closed automatically on scope exit
+```
+
+### Sampling Adapters
+
+Forward LLM sampling requests from servers to your AI provider with a single line:
+
+```typescript
+import { Client, AnthropicSamplingAdapter } from '@prefecthq/fastmcp-ts/client'
+import Anthropic from '@anthropic-ai/sdk'
+
+const client = await Client.connect('http://localhost:3000', {
+  handlers: {
+    sampling: new AnthropicSamplingAdapter(new Anthropic()).asHandler(),
+  },
+})
+```
+
+Also ships with `OpenAISamplingAdapter` and `GoogleSamplingAdapter`.
+
+### Multi-Server
+
+Connect to multiple servers from a single client. Tools, resources, and prompts are namespaced by server name automatically.
+
+```typescript
+import { Client } from '@prefecthq/fastmcp-ts/client'
+
+const client = await Client.connect({
+  mcpServers: {
+    weather: { url: 'http://localhost:3001' },
+    maps:    { url: 'http://localhost:3002' },
+  },
+})
+
+// tool names become weather_forecast, maps_geocode, …
+const forecast = await client.callTool('weather_forecast', { city: 'New York' })
+```
+
+---
+
+## Apps
+
+FastMCP ships a server-side component library for building interactive UIs rendered directly in MCP host conversations.
+
+```typescript
+import { FastMCPApp, Column, Row, Text, Input, Button, Table } from '@prefecthq/fastmcp-ts/server'
+
+const app = new FastMCPApp({ name: 'search-app', version: '1.0.0' })
+
+// Entry-point tool: visible to the LLM, auto-linked to a ui:// resource
+app.entrypoint(
+  { name: 'search', description: 'Search the product catalog' },
+  () =>
+    Column({}, [
+      Text('Product Search'),
+      Row({}, [
+        Input({ name: 'query', placeholder: 'Search products…' }),
+        Button({ label: 'Search', action: app.toolRef('run_search') }),
+      ]),
+    ])
+)
+
+// Backend tool: hidden from the LLM, callable only from within the rendered UI
+app.backendTool(
+  { name: 'run_search', description: 'Execute the search query' },
+  async ({ query }: { query: string }) => {
+    const rows = await db.search(query)
+    return Table({ columns: ['Name', 'Price', 'Stock'], rows })
+  }
+)
+
+await app.server.run({ transport: 'http', port: 3000 })
+```
+
+### Built-in Providers
+
+Ready-to-mount interactive primitives:
+
+```typescript
+import { FastMCP, Approval, Choice, FileUpload, FormInput } from '@prefecthq/fastmcp-ts/server'
+import { z } from 'zod'
+
+const server = new FastMCP({ name: 'my-server' })
+
+server.addProvider(new Approval())    // confirm/deny card injected back into the conversation
+server.addProvider(new Choice())      // clickable option list
+server.addProvider(new FileUpload())  // drag-and-drop file picker; file bytes never pass through the LLM
+
+// Auto-generated, validated form from any Standard Schema
+server.addProvider(
+  new FormInput({
+    name: 'contact_form',
+    description: 'Contact form',
+    schema: z.object({ name: z.string(), email: z.string() }),
+  }),
+)
+```
+
+### Generative UI
+
+Let the LLM compose component trees at runtime:
+
+```typescript
+import { FastMCP, GenerativeUI } from '@prefecthq/fastmcp-ts/server'
+
+const server = new FastMCP({ name: 'my-server' })
+server.addProvider(new GenerativeUI())
+// registers generate_ui and search_components tools
+
+await server.run()
+```
+
+---
+
+## CLI
+
+```bash
+# Start a server
+fastmcp run server.ts
+fastmcp run server.ts --transport http --port 3000
+
+# Inspect a server's tools, resources, and prompts
+fastmcp inspect --file server.ts
+fastmcp inspect --url http://localhost:3000
+fastmcp inspect --file server.ts --json
+fastmcp inspect --file server.ts --legacy       # force the legacy 2025 era, no probe
+fastmcp inspect --file server.ts --pin 2026-07-28  # require that exact era
+
+# Call a tool, read a resource, or get a prompt
+fastmcp call add --file server.ts a=1 b=2
+fastmcp call config://settings --url http://localhost:3000
+
+# Connect to a running server and list its components
+fastmcp list --url http://localhost:3000
+fastmcp list --url http://localhost:3000 --resources --prompts --json
+
+# Open the MCP Inspector UI with file-watch reload
+fastmcp dev inspector server.ts
+
+# Install into editor/client configs
+fastmcp install claude-code server.ts
+fastmcp install cursor server.ts
+fastmcp install claude-desktop server.ts
+
+# Find locally configured MCP servers
+fastmcp discover
+```
+
+`fastmcp inspect`, `fastmcp list`, and `fastmcp call` negotiate the protocol era automatically on every transport: one probe at connect, the modern 2026-07-28 era when the server offers it, and the legacy 2025 era otherwise. Add `--legacy` to skip the probe and force the legacy era. `--pin <version>` works on every transport, including HTTP. It forces that exact protocol revision. The connection fails if the server does not offer it. `--modern` is a deprecated no-op, kept for compatibility.
+
+---
+
+## Ecosystem
+
+| Package | Role |
+|---|---|
+| [`@modelcontextprotocol/server`](https://www.npmjs.com/package/@modelcontextprotocol/server) | Official MCP TypeScript SDK v2 — the server-side protocol implementation FastMCP builds on |
+| [`@modelcontextprotocol/client`](https://www.npmjs.com/package/@modelcontextprotocol/client) | Official MCP TypeScript SDK v2 — the client-side protocol implementation FastMCP builds on |
+| [`fastmcp` (PyPI)](https://github.com/PrefectHQ/fastmcp) | The Python original this project models its API after |
+| [`@modelcontextprotocol/ext-apps`](https://github.com/modelcontextprotocol/ext-apps) | Official MCP Apps extension — foundation for the Apps pillar |
